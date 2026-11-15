@@ -1,160 +1,128 @@
-"""
-Lapisan 4b: BOT TELEGRAM (P16) - asisten data katalog buku.
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
+from analisis import DataAnalyzer
+from config import Config, setup_logger
+from db import DatabaseManager
+from laporan import ReportGenerator
+from pesan import MessageFormatter
+from scraper import CarousellScraper
 
-Bot membaca database yang sama dengan pipeline (data/buku.db),
-jadi jalankan main.py minimal sekali sebelum menyalakan bot.
-
-Jalankan: python bot.py   (hentikan dengan Ctrl+C)
-"""
-import datetime
-import logging
-from zoneinfo import ZoneInfo
-
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-
-import analisis
-import config
-import db
-import pesan
-
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-                    level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("pantaubuku")
-
-WIB = ZoneInfo("Asia/Jakarta")
+logger = setup_logger("telegram_bot")
 
 
-def muat():
-    """Baca data terbaru setiap kali dipakai, agar hasil pipeline baru langsung terlihat."""
-    return analisis.bersihkan(db.baca_buku())
+class CarousellTelegramBot:
+    def __init__(self):
+        self.scraper = CarousellScraper()
+        self.db = DatabaseManager()
+        self.reporter = ReportGenerator()
 
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        text = (
+            "👋 *Bot Scraper & Pantau Harga Carousell Indonesia*\n\n"
+            "Perintah yang tersedia:\n"
+            "• `/scrape [keyword]` — Ambil data terbaru (default: `botol`)\n"
+            "• `/analisis [keyword]` — Lihat statistik harga dari database\n"
+            "• `/laporan [keyword]` — Unduh laporan Excel (.xlsx)\n"
+            "• `/pantau on|off` — Aktifkan pemantauan otomatis berkala"
+        )
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    nama = update.effective_user.first_name
-    await update.message.reply_text(
-        f"Halo, {nama}! Aku PantauBuku, asisten data katalog buku.\n\n" + pesan.BANTUAN)
+    async def cmd_scrape(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        keyword = " ".join(context.args).strip() or Config.DEFAULT_KEYWORD
+        await update.message.reply_text(f"⏳ Mengambil data Carousell untuk `{keyword}`...", parse_mode=ParseMode.MARKDOWN)
 
+        items = self.scraper.scrape(keyword=keyword)
+        sync_result = self.db.save_listings(items, keyword=keyword)
 
-async def bantuan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(pesan.BANTUAN)
+        if sync_result["new"] or sync_result["price_drops"]:
+            msg = MessageFormatter.format_new_items_alert(
+                sync_result["new"], sync_result["price_drops"], keyword
+            )
+        else:
+            msg = (
+                f"✅ Selesai memindai *{len(items)}* produk untuk `{keyword}`.\n"
+                "Belum ada produk baru atau perubahan harga sejak pengecekan terakhir."
+            )
 
+        await update.message.reply_text(
+            msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+        )
 
-async def ringkas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = muat()
-    if df.empty:
-        await update.message.reply_text("Data belum ada. Jalankan python main.py dulu.")
-        return
-    await update.message.reply_text(
-        pesan.format_ringkasan(analisis.ringkasan(df), analisis.temuan(df)))
+    async def cmd_analisis(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        keyword = " ".join(context.args).strip() or Config.DEFAULT_KEYWORD
+        items = self.db.get_listings(keyword=keyword, limit=200)
+        summary = DataAnalyzer.analyze(items)
+        msg = MessageFormatter.format_analysis(summary, keyword)
+        await update.message.reply_text(
+            msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
+        )
 
+    async def cmd_laporan(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        keyword = " ".join(context.args).strip() or Config.DEFAULT_KEYWORD
+        items = self.db.get_listings(keyword=keyword, limit=500)
+        if not items:
+            await update.message.reply_text("Data kosong. Jalankan `/scrape` terlebih dahulu.", parse_mode=ParseMode.MARKDOWN)
+            return
 
-async def cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Contoh: /cari python")
-        return
-    kata = " ".join(context.args)
-    hasil = db.cari(kata, batas=5)
-    await update.message.reply_text(pesan.format_daftar_buku(hasil, f'Hasil pencarian "{kata}":'))
+        summary = DataAnalyzer.analyze(items)
+        excel_path = self.reporter.export_excel(items, summary, keyword=keyword)
+        with open(excel_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=excel_path.name,
+                caption=f"📑 Laporan Carousell `{keyword}` ({len(items)} produk)",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
+    async def scheduled_monitor(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        keyword = Config.DEFAULT_KEYWORD
+        logger.info("Menjalankan jadwal pantau otomatis untuk '%s'", keyword)
+        items = self.scraper.scrape(keyword=keyword)
+        sync_result = self.db.save_listings(items, keyword=keyword)
 
-async def kategori(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = muat()
-    semua = sorted(df["kategori"].unique())
-    if not context.args:
-        await update.message.reply_text("Contoh: /kategori travel\n\nKategori: " + ", ".join(semua))
-        return
-    nama = pesan.cocokkan_kategori(" ".join(context.args), semua)
-    if nama is None:
-        await update.message.reply_text("Kategori tidak ditemukan. Ketik /kategori untuk daftarnya.")
-        return
-    termurah = df[df["kategori"] == nama].nsmallest(5, "harga")
-    await update.message.reply_text(pesan.format_daftar_buku(termurah, f"5 buku termurah di {nama}:"))
+        if (sync_result["new"] or sync_result["price_drops"]) and Config.TELEGRAM_CHAT_ID:
+            msg = MessageFormatter.format_new_items_alert(
+                sync_result["new"], sync_result["price_drops"], keyword
+            )
+            await context.bot.send_message(
+                chat_id=Config.TELEGRAM_CHAT_ID,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
 
+    async def cmd_pantau(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        mode = context.args[0].lower() if context.args else "on"
+        job_name = "carousell_auto_monitor"
 
-async def grafik(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    df = muat()
-    if df.empty:
-        await update.message.reply_text("Data belum ada. Jalankan python main.py dulu.")
-        return
-    path = analisis.buat_grafik(df)
-    for kunci, keterangan in [("kategori", "Kategori terbanyak"),
-                              ("rating", "Harga menurut rating"),
-                              ("termahal", "Kategori termahal")]:
-        with open(path[kunci], "rb") as f:
-            await update.message.reply_photo(f, caption=keterangan)
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
 
+        if mode == "off":
+            await update.message.reply_text("🛑 Pemantauan otomatis dimatikan.")
+            return
 
-async def berubah(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(pesan.format_perubahan(db.perubahan_harga()))
+        interval_sec = Config.SCRAPE_INTERVAL_MINUTES * 60
+        context.job_queue.run_repeating(
+            self.scheduled_monitor, interval=interval_sec, first=10, name=job_name
+        )
+        await update.message.reply_text(
+            f"🟢 Pemantauan otomatis aktif setiap *{Config.SCRAPE_INTERVAL_MINUTES} menit*.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
+    def run(self) -> None:
+        if not Config.TELEGRAM_BOT_TOKEN:
+            raise ValueError("TELEGRAM_BOT_TOKEN belum diisi di file .env")
 
-# ---------- Notifikasi otomatis dengan JobQueue ----------
-async def kirim_harian(context: ContextTypes.DEFAULT_TYPE):
-    df = muat()
-    teks = pesan.format_ringkasan(analisis.ringkasan(df), analisis.temuan(df))
-    teks += "\n\n" + pesan.format_perubahan(db.perubahan_harga(), batas=5)
-    await context.bot.send_message(chat_id=context.job.chat_id, text=teks)
+        app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start", self.cmd_start))
+        app.add_handler(CommandHandler("help", self.cmd_start))
+        app.add_handler(CommandHandler("scrape", self.cmd_scrape))
+        app.add_handler(CommandHandler("analisis", self.cmd_analisis))
+        app.add_handler(CommandHandler("laporan", self.cmd_laporan))
+        app.add_handler(CommandHandler("pantau", self.cmd_pantau))
 
-
-async def langganan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    for job in context.job_queue.get_jobs_by_name(f"harian-{chat_id}"):
-        job.schedule_removal()  # hindari langganan ganda
-    jam, menit = map(int, config.JAM_JADWAL.split(":"))
-    context.job_queue.run_daily(kirim_harian, time=datetime.time(jam, menit, tzinfo=WIB),
-                                chat_id=chat_id, name=f"harian-{chat_id}")
-    await update.message.reply_text(f"Siap! Laporan dikirim setiap hari pukul {config.JAM_JADWAL} WIB.")
-
-
-async def berhenti(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    jobs = context.job_queue.get_jobs_by_name(f"harian-{update.effective_chat.id}")
-    for job in jobs:
-        job.schedule_removal()
-    await update.message.reply_text("Langganan dihentikan." if jobs else "Kamu belum berlangganan.")
-
-
-async def tak_dikenal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Perintah tidak dikenal. Ketik /help.")
-
-
-async def saat_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Error saat memproses update", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        await update.effective_message.reply_text("Maaf, terjadi kesalahan. Coba lagi.")
-
-
-async def setelah_mulai(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("ringkas", "Ringkasan katalog"),
-        BotCommand("cari", "Cari buku berdasarkan judul"),
-        BotCommand("kategori", "Buku termurah per kategori"),
-        BotCommand("grafik", "Grafik analisis"),
-        BotCommand("berubah", "Buku yang berubah harga"),
-        BotCommand("langganan", "Laporan harian"),
-        BotCommand("help", "Bantuan"),
-    ])
-
-
-def buat_aplikasi(token):
-    app = Application.builder().token(token).post_init(setelah_mulai).build()
-    for nama, fungsi in [("start", start), ("help", bantuan), ("ringkas", ringkas),
-                         ("cari", cari), ("kategori", kategori), ("grafik", grafik),
-                         ("berubah", berubah), ("langganan", langganan), ("berhenti", berhenti)]:
-        app.add_handler(CommandHandler(nama, fungsi))
-    app.add_handler(MessageHandler(filters.COMMAND, tak_dikenal))  # paling akhir
-    app.add_error_handler(saat_error)
-    return app
-
-
-def main():
-    if not config.BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN belum diisi. Salin .env.example menjadi .env lalu isi tokennya.")
-    app = buat_aplikasi(config.BOT_TOKEN)
-    log.info("Bot berjalan. Tekan Ctrl+C untuk berhenti.")
-    app.run_polling(allowed_updates=["message"])
-
-
-if __name__ == "__main__":
-    main()
+        logger.info("Bot Telegram berjalan...")
+        app.run_polling()

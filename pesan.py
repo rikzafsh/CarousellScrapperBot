@@ -1,60 +1,64 @@
-"""
-Teks balasan bot. Fungsi murni (tanpa Telegram) agar mudah diuji dengan pytest,
-sama seperti logika.py di praktikum bot.
-"""
-BANTUAN = (
-    "Perintah yang tersedia:\n"
-    "/ringkas - ringkasan katalog\n"
-    "/cari <kata> - cari buku berdasarkan judul\n"
-    "/kategori <nama> - 5 buku termurah di kategori\n"
-    "/grafik - kirim grafik analisis\n"
-    "/berubah - buku yang harganya berubah\n"
-    "/langganan - laporan harian pukul 07.00 WIB\n"
-    "/berhenti - hentikan laporan harian\n"
-    "/help - bantuan ini"
-)
+from typing import Any
 
 
-def format_ringkasan(r, temuan):
-    baris = [
-        "Ringkasan katalog buku",
-        f"Jumlah buku    : {r['jumlah_buku']}",
-        f"Kategori       : {r['jumlah_kategori']}",
-        f"Harga rata-rata: £{r['harga_rata']:.2f}",
-        f"Rentang harga  : £{r['harga_min']:.2f} - £{r['harga_maks']:.2f}",
-        f"Tersedia       : {r['persen_tersedia']}%",
-        "",
-        "Temuan:",
-    ]
-    baris += [f"{i}. {t}" for i, t in enumerate(temuan, 1)]
-    return "\n".join(baris)
+class MessageFormatter:
+    @staticmethod
+    def format_rupiah(amount: int) -> str:
+        if amount <= 0:
+            return "Gratis / Hubungi Penjual"
+        return f"Rp {amount:,}".replace(",", ".")
 
+    @classmethod
+    def format_new_items_alert(
+        cls,
+        new_items: list[dict[str, Any]],
+        price_drops: list[dict[str, Any]],
+        keyword: str,
+    ) -> str:
+        lines = [f"🔔 *Update Carousell: `{keyword}`*\n"]
 
-def format_daftar_buku(df, judul):
-    """df berisi kolom judul, harga, rating. Kembalikan teks bernomor."""
-    if df.empty:
-        return "Tidak ada buku yang cocok."
-    baris = [judul]
-    for i, b in enumerate(df.itertuples(), 1):
-        baris.append(f"{i}. {b.judul} - £{b.harga:.2f} ({'★' * int(b.rating)})")
-    return "\n".join(baris)
+        if new_items:
+            lines.append(f"🆕 *{len(new_items)} Produk Baru Ditemukan:*")
+            for item in new_items[:8]:
+                price_txt = cls.format_rupiah(item["price"])
+                lines.append(
+                    f"• [{item['title']}]({item['url']})\n"
+                    f"  💰 {price_txt} | 📦 {item.get('condition', '-')} | 🕒 {item.get('time_posted', '-')}"
+                )
 
+        if price_drops:
+            lines.append(f"\n📉 *{len(price_drops)} Penurunan Harga:*")
+            for item in price_drops[:5]:
+                old_txt = cls.format_rupiah(item["old_price"])
+                new_txt = cls.format_rupiah(item["price"])
+                lines.append(
+                    f"• [{item['title']}]({item['url']})\n"
+                    f"  ~~{old_txt}~~ ➡️ *{new_txt}*"
+                )
 
-def format_perubahan(df, batas=10):
-    if df.empty:
-        return "Belum ada perubahan harga sejak scrape sebelumnya."
-    baris = [f"{len(df)} buku berubah harga:"]
-    for b in df.head(batas).itertuples():
-        arah = "turun" if b.selisih < 0 else "naik"
-        baris.append(f"• {b.judul}: £{b.harga_lama:.2f} → £{b.harga_baru:.2f} ({arah})")
-    return "\n".join(baris)
+        return "\n".join(lines)
 
+    @classmethod
+    def format_analysis(cls, summary: dict[str, Any], keyword: str) -> str:
+        if summary.get("total_items", 0) == 0:
+            return f"Belum ada data tersimpan untuk kata kunci `{keyword}`."
 
-def cocokkan_kategori(nama, semua):
-    """Cari nama kategori tanpa peduli huruf besar/kecil. None jika tidak ada."""
-    nama = nama.strip().lower()
-    for k in semua:
-        if k.lower() == nama:
-            return k
-    awalan = [k for k in semua if k.lower().startswith(nama)]
-    return awalan[0] if len(awalan) == 1 else None
+        lines = [
+            f"📊 *Analisis Harga Carousell (`{keyword}`)*",
+            f"• Total listing: *{summary['total_items']}*",
+            f"• Rata-rata harga: *{cls.format_rupiah(summary['avg_price'])}*",
+            f"• Median harga: *{cls.format_rupiah(summary['median_price'])}*",
+            f"• Harga terendah: *{cls.format_rupiah(summary['min_price'])}*",
+            f"• Harga tertinggi: *{cls.format_rupiah(summary['max_price'])}*",
+            "\n*Distribusi Kondisi:*",
+        ]
+        for cond, count in summary.get("condition_breakdown", {}).items():
+            lines.append(f"  - {cond}: {count}")
+
+        deals = summary.get("best_deals", [])
+        if deals:
+            lines.append("\n🔥 *Penawaran Di Bawah Pasar:*")
+            for d in deals:
+                lines.append(f"• [{d['title']}]({d['url']}) — *{cls.format_rupiah(d['price'])}*")
+
+        return "\n".join(lines)

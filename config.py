@@ -1,31 +1,67 @@
-"""
-Pengaturan proyek di satu tempat.
-
-Nilai rahasia (token bot) dibaca dari file .env, bukan ditulis di kode (P15).
-"""
+import logging
 import os
 from pathlib import Path
-
+from urllib.parse import quote
 from dotenv import load_dotenv
 
-load_dotenv()  # baca .env ke os.environ (jika file ada)
+load_dotenv()
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-OUTPUT_DIR = ROOT / "output"
-LOG_DIR = ROOT / "logs"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+OUTPUT_DIR = BASE_DIR / os.getenv("OUTPUT_DIR", "output")
+LOG_DIR = BASE_DIR / os.getenv("LOG_DIR", "logs")
 
-DB_PATH = DATA_DIR / "buku.db"
+for folder in (DATA_DIR, OUTPUT_DIR, LOG_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
 
-# Sumber data. Boleh diganti lewat .env, misalnya untuk uji dengan server lokal.
-BASE_URL = os.getenv("BASE_URL", "https://books.toscrape.com/")
-USER_AGENT = "PantauBuku/1.0 (Proyek Pekan ke-12 Scripting Language UNY)"
-JEDA_DETIK = float(os.getenv("JEDA_DETIK", "1.0"))  # jeda sopan antar-request
-TIMEOUT_DETIK = 10
-MAKS_COBA = 3  # retry jika request gagal
 
-# Bot Telegram (opsional, hanya dibutuhkan bot.py)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+class Config:
+    TARGET_URL: str = os.getenv(
+        "TARGET_URL",
+        "https://id.carousell.com/search/botol?addRecent=true&canChangeKeyword=true&includeSuggestions=true&sort_by=3&t-search_query_source=direct_search",
+    )
+    DEFAULT_KEYWORD: str = os.getenv("DEFAULT_KEYWORD", "botol")
+    MAX_ITEMS: int = int(os.getenv("MAX_ITEMS", "40"))
+    HEADLESS: bool = os.getenv("HEADLESS", "true").lower() == "true"
 
-# Jadwal pipeline harian (WIB)
-JAM_JADWAL = os.getenv("JAM_JADWAL", "07:00")
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    SCRAPE_INTERVAL_MINUTES: int = int(os.getenv("SCRAPE_INTERVAL_MINUTES", "15"))
+
+    DB_PATH: str = str(BASE_DIR / os.getenv("DB_PATH", "data/carousell.db"))
+    OUTPUT_DIR: Path = OUTPUT_DIR
+    LOG_DIR: Path = LOG_DIR
+    FLASK_PORT: int = int(os.getenv("FLASK_PORT", "5000"))
+
+    @staticmethod
+    def build_search_url(keyword: str | None = None) -> str:
+        if not keyword or keyword.strip().lower() == Config.DEFAULT_KEYWORD.lower():
+            return Config.TARGET_URL
+        encoded = quote(keyword.strip())
+        return (
+            f"https://id.carousell.com/search/{encoded}"
+            "?addRecent=true&canChangeKeyword=true&includeSuggestions=true"
+            "&sort_by=3&t-search_query_source=direct_search"
+        )
+
+
+def setup_logger(name: str = "carousell_bot") -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(LOG_DIR / "bot.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger

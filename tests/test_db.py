@@ -1,26 +1,22 @@
-import db
+def test_save_and_price_drop(temp_db):
+    item_v1 = [
+        {
+            "listing_id": "1001",
+            "keyword": "botol",
+            "title": "Botol Hydro Flask",
+            "price": 300000,
+            "condition": "Baru",
+            "seller": "user1",
+            "time_posted": "1 jam lalu",
+            "url": "https://id.carousell.com/p/botol-1001/",
+        }
+    ]
+    res1 = temp_db.save_listings(item_v1, keyword="botol")
+    assert len(res1["new"]) == 1
+    assert len(res1["price_drops"]) == 0
 
-
-def test_simpan_tanpa_duplikat(contoh_buku, db_path):
-    assert db.simpan(contoh_buku, "2026-11-10T07:00:00", path=db_path) == 3
-    assert db.simpan(contoh_buku, "2026-11-11T07:00:00", path=db_path) == 0  # tidak ada buku baru
-    df = db.baca_buku(db_path)
-    assert len(df) == 3
-    assert set(df["pertama_dilihat"]) == {"2026-11-10T07:00:00"}
-    assert set(df["terakhir_dilihat"]) == {"2026-11-11T07:00:00"}
-
-
-def test_cari_aman_dari_sql_injection(contoh_buku, db_path):
-    db.simpan(contoh_buku, path=db_path)
-    assert db.cari("python", path=db_path)["judul"].tolist() == ["Buku B Python"]
-    assert db.cari("' OR 1=1 --", path=db_path).empty
-
-
-def test_perubahan_harga(contoh_buku, db_path):
-    db.simpan(contoh_buku, "2026-11-10T07:00:00", path=db_path)
-    assert db.perubahan_harga(db_path).empty
-    contoh_buku[0]["harga"] = 8.5
-    db.simpan(contoh_buku, "2026-11-11T07:00:00", path=db_path)
-    berubah = db.perubahan_harga(db_path)
-    assert berubah["judul"].tolist() == ["Buku A"]
-    assert berubah["selisih"].iloc[0] == -1.5
+    item_v2 = [{**item_v1[0], "price": 220000}]
+    res2 = temp_db.save_listings(item_v2, keyword="botol")
+    assert len(res2["new"]) == 0
+    assert len(res2["price_drops"]) == 1
+    assert res2["price_drops"][0]["old_price"] == 300000

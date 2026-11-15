@@ -1,131 +1,141 @@
-"""
-Lapisan 2: PENYIMPANAN (P12).
-
-Dua tabel:
-- buku          : satu baris per buku (url sebagai PRIMARY KEY), kondisi terakhir.
-- riwayat_harga : satu baris per buku per kali scrape, untuk memantau perubahan.
-
-Menjalankan pipeline berulang kali TIDAK membuat duplikat di tabel buku.
-"""
 import sqlite3
-from contextlib import contextmanager
-from datetime import datetime
-
-import pandas as pd
-
-import config
+from datetime import datetime, timezone
+from typing import Any
+from config import Config
 
 
-@contextmanager
-def koneksi(path=config.DB_PATH):
-    """Buka database, commit jika sukses (rollback jika error), lalu tutup."""
-    con = sqlite3.connect(path)
-    try:
-        with con:
-            yield con
-    finally:
-        con.close()
+class DatabaseManager:
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path or Config.DB_PATH
+        self.init_db()
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-def siapkan(path=config.DB_PATH):
-    """Buat tabel jika belum ada."""
-    with koneksi(path) as con:
-        con.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS buku (
-                url              TEXT PRIMARY KEY,
-                judul            TEXT NOT NULL,
-                kategori         TEXT,
-                harga            REAL,
-                rating           INTEGER,
-                tersedia         INTEGER,     -- 1 = In stock, 0 = habis
-                pertama_dilihat  TEXT,        -- waktu scrape pertama
-                terakhir_dilihat TEXT         -- waktu scrape terakhir
-            );
-            CREATE TABLE IF NOT EXISTS riwayat_harga (
-                url          TEXT,
-                waktu_scrape TEXT,
-                harga        REAL,
-                tersedia     INTEGER,
-                PRIMARY KEY (url, waktu_scrape)
-            );
-            """
-        )
-
-
-def simpan(data, waktu=None, path=config.DB_PATH):
-    """Simpan list dict hasil scraper. Kembalikan jumlah buku baru."""
-    waktu = waktu or datetime.now().isoformat(timespec="seconds")
-    siapkan(path)
-    with koneksi(path) as con:
-        sebelum = con.execute("SELECT COUNT(*) FROM buku").fetchone()[0]
-        con.executemany(
-            """INSERT INTO buku (url, judul, kategori, harga, rating, tersedia,
-                                 pertama_dilihat, terakhir_dilihat)
-               VALUES (:url, :judul, :kategori, :harga, :rating, :tersedia, :waktu, :waktu)
-               ON CONFLICT(url) DO UPDATE SET
-                   judul = excluded.judul,
-                   kategori = excluded.kategori,
-                   harga = excluded.harga,
-                   rating = excluded.rating,
-                   tersedia = excluded.tersedia,
-                   terakhir_dilihat = excluded.terakhir_dilihat""",
-            [{**b, "tersedia": int(b["tersedia"]), "waktu": waktu} for b in data],
-        )
-        con.executemany(
-            """INSERT OR IGNORE INTO riwayat_harga (url, waktu_scrape, harga, tersedia)
-               VALUES (?, ?, ?, ?)""",
-            [(b["url"], waktu, b["harga"], int(b["tersedia"])) for b in data],
-        )
-        sesudah = con.execute("SELECT COUNT(*) FROM buku").fetchone()[0]
-    return sesudah - sebelum
-
-
-def baca_buku(path=config.DB_PATH):
-    """Seluruh tabel buku sebagai DataFrame (dipakai analisis, bot, dashboard)."""
-    siapkan(path)
-    with koneksi(path) as con:
-        return pd.read_sql("SELECT * FROM buku", con)
-
-
-def cari(kata, batas=5, path=config.DB_PATH):
-    """Cari buku berdasarkan judul. Parameter ? mencegah SQL injection."""
-    with koneksi(path) as con:
-        return pd.read_sql(
-            "SELECT judul, kategori, harga, rating FROM buku "
-            "WHERE judul LIKE ? ORDER BY harga LIMIT ?",
-            con, params=[f"%{kata}%", batas],
-        )
-
-
-def perubahan_harga(path=config.DB_PATH):
-    """Buku yang harganya berbeda antara dua scrape terakhir."""
-    siapkan(path)
-    with koneksi(path) as con:
-        return pd.read_sql(
-            """
-            WITH urut AS (
-                SELECT url, waktu_scrape, harga,
-                       ROW_NUMBER() OVER (PARTITION BY url ORDER BY waktu_scrape DESC) AS ke
-                FROM riwayat_harga
+    def init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS listings (
+                    listing_id TEXT PRIMARY KEY,
+                    keyword TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    price INTEGER NOT NULL,
+                    condition TEXT,
+                    seller TEXT,
+                    time_posted TEXT,
+                    url TEXT NOT NULL,
+                    image_url TEXT,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                )
+                """
             )
-            SELECT b.judul, b.kategori, lama.harga AS harga_lama, baru.harga AS harga_baru,
-                   ROUND(baru.harga - lama.harga, 2) AS selisih
-            FROM urut baru
-            JOIN urut lama ON lama.url = baru.url AND lama.ke = 2
-            JOIN buku b ON b.url = baru.url
-            WHERE baru.ke = 1 AND baru.harga <> lama.harga
-            ORDER BY selisih
-            """,
-            con,
-        )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scrape_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL,
+                    total_scraped INTEGER NOT NULL,
+                    new_count INTEGER NOT NULL,
+                    price_drop_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
 
+    def save_listings(
+        self, items: list[dict[str, Any]], keyword: str = ""
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        new_items: list[dict[str, Any]] = []
+        price_drops: list[dict[str, Any]] = []
 
-def riwayat(path=config.DB_PATH):
-    """Seluruh riwayat harga (untuk grafik tren di dashboard)."""
-    siapkan(path)
-    with koneksi(path) as con:
-        return pd.read_sql(
-            "SELECT r.*, b.judul, b.kategori FROM riwayat_harga r JOIN buku b USING (url)",
-            con,
-        )
+        with self._connect() as conn:
+            for item in items:
+                lid = item["listing_id"]
+                existing = conn.execute(
+                    "SELECT price FROM listings WHERE listing_id = ?", (lid,)
+                ).fetchone()
+
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO listings (
+                            listing_id, keyword, title, price, condition,
+                            seller, time_posted, url, image_url, first_seen, last_seen
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            lid,
+                            item.get("keyword") or keyword,
+                            item["title"],
+                            item["price"],
+                            item.get("condition", ""),
+                            item.get("seller", ""),
+                            item.get("time_posted", ""),
+                            item["url"],
+                            item.get("image_url", ""),
+                            now,
+                            now,
+                        ),
+                    )
+                    new_items.append(item)
+                else:
+                    old_price = existing["price"]
+                    new_price = item["price"]
+                    if 0 < new_price < old_price:
+                        drop_info = {**item, "old_price": old_price}
+                        price_drops.append(drop_info)
+
+                    conn.execute(
+                        """
+                        UPDATE listings
+                        SET title = ?, price = ?, condition = ?, time_posted = ?, last_seen = ?
+                        WHERE listing_id = ?
+                        """,
+                        (
+                            item["title"],
+                            new_price,
+                            item.get("condition", ""),
+                            item.get("time_posted", ""),
+                            now,
+                            lid,
+                        ),
+                    )
+
+            conn.execute(
+                """
+                INSERT INTO scrape_logs (keyword, total_scraped, new_count, price_drop_count, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    keyword or Config.DEFAULT_KEYWORD,
+                    len(items),
+                    len(new_items),
+                    len(price_drops),
+                    now,
+                ),
+            )
+
+        return {
+            "new": new_items,
+            "price_drops": price_drops,
+            "total_processed": len(items),
+        }
+
+    def get_listings(self, keyword: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if keyword:
+                rows = conn.execute(
+                    "SELECT * FROM listings WHERE keyword = ? ORDER BY last_seen DESC LIMIT ?",
+                    (keyword, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM listings ORDER BY last_seen DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(row) for row in rows]
