@@ -1,3 +1,4 @@
+from datetime import time, timedelta, timezone
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -9,6 +10,7 @@ from pesan import MessageFormatter
 from scraper import CarousellScraper
 
 logger = setup_logger("telegram_bot")
+WIB = timezone(timedelta(hours=7))
 
 
 class CarousellTelegramBot:
@@ -20,17 +22,25 @@ class CarousellTelegramBot:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             "👋 *Bot Scraper & Pantau Harga Carousell Indonesia*\n\n"
-            "Perintah yang tersedia:\n"
-            "• `/scrape [keyword]` — Ambil data terbaru (default: `botol`)\n"
-            "• `/analisis [keyword]` — Lihat statistik harga dari database\n"
-            "• `/laporan [keyword]` — Unduh laporan Excel (.xlsx)\n"
-            "• `/pantau on|off` — Aktifkan pemantauan otomatis berkala"
+            "Perintah tersedia:\n"
+            "• `/scrape [keyword]` — Ambil data sekarang (default: `botol`)\n"
+            "• `/analisis [keyword]` — Lihat statistik harga\n"
+            "• `/laporan [keyword]` — Unduh file Excel (.xlsx)\n"
+            "• `/id` — Cek Chat ID Telegram kamu\n\n"
+            "⏰ *Jadwal Otomatis:* Aktif setiap hari pukul *07:00 WIB*."
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+    async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(
+            f"Chat ID kamu: `{update.effective_chat.id}`", parse_mode=ParseMode.MARKDOWN
+        )
+
     async def cmd_scrape(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyword = " ".join(context.args).strip() or Config.DEFAULT_KEYWORD
-        await update.message.reply_text(f"⏳ Mengambil data Carousell untuk `{keyword}`...", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"⏳ Mengambil data Carousell untuk `{keyword}`...", parse_mode=ParseMode.MARKDOWN
+        )
 
         items = self.scraper.scrape(keyword=keyword)
         sync_result = self.db.save_listings(items, keyword=keyword)
@@ -42,7 +52,7 @@ class CarousellTelegramBot:
         else:
             msg = (
                 f"✅ Selesai memindai *{len(items)}* produk untuk `{keyword}`.\n"
-                "Belum ada produk baru atau perubahan harga sejak pengecekan terakhir."
+                "Belum ada produk baru atau penurunan harga sejak pengecekan terakhir."
             )
 
         await update.message.reply_text(
@@ -62,7 +72,9 @@ class CarousellTelegramBot:
         keyword = " ".join(context.args).strip() or Config.DEFAULT_KEYWORD
         items = self.db.get_listings(keyword=keyword, limit=500)
         if not items:
-            await update.message.reply_text("Data kosong. Jalankan `/scrape` terlebih dahulu.", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "Data kosong. Jalankan `/scrape` terlebih dahulu.", parse_mode=ParseMode.MARKDOWN
+            )
             return
 
         summary = DataAnalyzer.analyze(items)
@@ -77,39 +89,29 @@ class CarousellTelegramBot:
 
     async def scheduled_monitor(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyword = Config.DEFAULT_KEYWORD
-        logger.info("Menjalankan jadwal pantau otomatis untuk '%s'", keyword)
+        logger.info("Menjalankan jadwal harian 07:00 WIB untuk '%s'", keyword)
         items = self.scraper.scrape(keyword=keyword)
         sync_result = self.db.save_listings(items, keyword=keyword)
 
-        if (sync_result["new"] or sync_result["price_drops"]) and Config.TELEGRAM_CHAT_ID:
+        if not Config.TELEGRAM_CHAT_ID:
+            logger.warning("TELEGRAM_CHAT_ID kosong, notifikasi dilewati.")
+            return
+
+        if sync_result["new"] or sync_result["price_drops"]:
             msg = MessageFormatter.format_new_items_alert(
                 sync_result["new"], sync_result["price_drops"], keyword
             )
-            await context.bot.send_message(
-                chat_id=Config.TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
+        else:
+            msg = (
+                f"🌅 *Laporan Harian 07:00 WIB (`{keyword}`)*\n"
+                f"Berhasil memindai *{len(items)}* produk. Tidak ada listing baru sejak kemarin."
             )
 
-    async def cmd_pantau(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        mode = context.args[0].lower() if context.args else "on"
-        job_name = "carousell_auto_monitor"
-
-        for job in context.job_queue.get_jobs_by_name(job_name):
-            job.schedule_removal()
-
-        if mode == "off":
-            await update.message.reply_text("🛑 Pemantauan otomatis dimatikan.")
-            return
-
-        interval_sec = Config.SCRAPE_INTERVAL_MINUTES * 60
-        context.job_queue.run_repeating(
-            self.scheduled_monitor, interval=interval_sec, first=10, name=job_name
-        )
-        await update.message.reply_text(
-            f"🟢 Pemantauan otomatis aktif setiap *{Config.SCRAPE_INTERVAL_MINUTES} menit*.",
+        await context.bot.send_message(
+            chat_id=Config.TELEGRAM_CHAT_ID,
+            text=msg,
             parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
         )
 
     def run(self) -> None:
@@ -119,10 +121,18 @@ class CarousellTelegramBot:
         app = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_start))
+        app.add_handler(CommandHandler("id", self.cmd_id))
         app.add_handler(CommandHandler("scrape", self.cmd_scrape))
         app.add_handler(CommandHandler("analisis", self.cmd_analisis))
         app.add_handler(CommandHandler("laporan", self.cmd_laporan))
-        app.add_handler(CommandHandler("pantau", self.cmd_pantau))
 
-        logger.info("Bot Telegram berjalan...")
+        # Jadwalkan otomatis setiap jam 17:00 WIB
+        jadwal_sore = time(hour=17, minute=0, tzinfo=WIB)
+        app.job_queue.run_daily(
+            self.scheduled_monitor,
+            time=jadwal_sore,
+            name="carousell_daily_1700",
+        )
+
+        logger.info("Bot Telegram aktif. Jadwal harian diatur pada 07:00 WIB.")
         app.run_polling()
